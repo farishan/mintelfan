@@ -78,7 +78,7 @@ async function thermalInfo(): Promise<ThermalInfo> {
     if (/No thermal warning/i.test(pmset)) pressure = "nominal";
     else {
       const m = pmset.match(/CPU_Speed_Limit\s*=\s*(\d+)/);
-      pressure = m ? (Number(m[1]) >= 100 ? "nominal" : `throttled (speed limit ${m[1]}%)`) : pmset.split("\n")[0].trim();
+      pressure = m ? (Number(m[1] ?? 100) >= 100 ? "nominal" : `throttled (speed limit ${m[1]}%)`) : pmset.split("\n")[0]?.trim() ?? null;
     }
   }
   if (!out) return { cpuDieC: null, cpuLevel: null, ioLevel: null, prochots: null, pressure, note: "unavailable (powermetrics requires sudo)" };
@@ -101,7 +101,7 @@ async function topEnergy(limit = 5): Promise<{ rows: EnergyProc[]; note: string 
     const rows: EnergyProc[] = [];
     for (const line of lines) {
       const m = line.match(/^\s*(.+?)\s+(\d+)\s+([\d.\s]+)$/);
-      if (!m) continue;
+      if (!m || !m[1] || !m[2] || !m[3]) continue;
       const nums = m[3].trim().split(/\s+/);
       if (nums.length < 7) continue;
       const energy = Number(nums[nums.length - 1]);
@@ -119,7 +119,7 @@ async function topEnergy(limit = 5): Promise<{ rows: EnergyProc[]; note: string 
     return { rows: [], note: "unavailable (powermetrics requires sudo)" };
   }
 }
-type Snapshot = {
+export type Snapshot = {
   timestamp: string;
   fans: number[];
   fanNote: string | null;
@@ -154,6 +154,151 @@ async function collectSnapshot(): Promise<Snapshot> {
     gpu: null,
   };
 }
+export type Verdict = "likely" | "possible" | "insufficient evidence";
+
+export type Contributor = {
+  name: string;
+  verdict: Exclude<Verdict, "insufficient evidence">;
+  evidence: string[];
+  confidence: "medium" | "low";
+};
+
+export type Analysis = {
+  verdict: Verdict;
+  contributors: Contributor[];
+  confidence: "medium" | "low" | null;
+  note: string | null;
+};
+
+const MIN_SAMPLES = 3;
+const MAX_HISTORY = 60;
+
+function avg(nums: number[]): number | null {
+  if (nums.length === 0) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+function avgTemp(snaps: Snapshot[]): number | null {
+  return avg(snaps.map((s) => s.thermal.cpuDieC).filter((v) => v !== null));
+}
+
+function avgFan(snaps: Snapshot[]): number | null {
+  return avg(
+    snaps
+      .filter((s) => s.fans.length > 0)
+      .map((s) => s.fans.reduce((a, b) => a + b, 0) / s.fans.length)
+  );
+}
+
+type ProcStat = { cpu: number; energy: number | null };
+
+function procStats(snaps: Snapshot[]): Map<string, ProcStat> {
+  const cpu = new Map<string, number[]>();
+  const energy = new Map<string, number[]>();
+  for (const s of snaps) {
+    for (const p of s.processes) {
+      const a = cpu.get(p.name) ?? [];
+      a.push(p.cpu);
+      cpu.set(p.name, a);
+    }
+    for (const e of s.energy) {
+      const a = energy.get(e.name) ?? [];
+      a.push(e.energy);
+      energy.set(e.name, a);
+    }
+  }
+  const out = new Map<string, ProcStat>();
+  for (const [name, vals] of cpu) {
+    const c = avg(vals) ?? 0;
+    const es = energy.get(name);
+    out.set(name, { cpu: c, energy: es ? avg(es) : null });
+  }
+  for (const [name, vals] of energy) {
+    if (!out.has(name)) out.set(name, { cpu: 0, energy: avg(vals) });
+  }
+  return out;
+}
+
+export function correlate(history: Snapshot[]): Analysis {
+  const none: Analysis = { verdict: "insufficient evidence", contributors: [], confidence: null, note: null };
+  if (history.length < MIN_SAMPLES) {
+    return { ...none, note: `need at least ${MIN_SAMPLES} snapshots (have ${history.length})` };
+  }
+  const mid = Math.floor(history.length / 2);
+  const base = history.slice(0, mid);
+  const recent = history.slice(mid);
+
+  const baseTemp = avgTemp(base);
+  const recentTemp = avgTemp(recent);
+  const baseFan = avgFan(base);
+  const recentFan = avgFan(recent);
+
+  const tempRise =
+    baseTemp !== null && recentTemp !== null && recentTemp - baseTemp >= 1.5;
+  const fanRise =
+    baseFan !== null &&
+    recentFan !== null &&
+    (recentFan - baseFan >= 150 || (baseFan > 0 && (recentFan - baseFan) / baseFan >= 0.05));
+
+  if (baseTemp === null && baseFan === null) {
+    return { ...none, note: "temperature and fan data unavailable (powermetrics requires sudo)" };
+  }
+  if (!tempRise && !fanRise) {
+    return { ...none, note: "no temperature/fan rise detected across samples" };
+  }
+
+  const baseStats = procStats(base);
+  const recentStats = procStats(recent);
+  const risen: { name: string; dCpu: number; cpuRise: boolean; eRise: boolean; bc: number; rc: number; be: number | null; re: number | null }[] = [];
+  for (const [name, r] of recentStats) {
+    const b = baseStats.get(name);
+    const bc = b?.cpu ?? 0;
+    const be = b?.energy ?? null;
+    const dCpu = r.cpu - bc;
+    const cpuRise = dCpu >= 2;
+    const eRise =
+      r.energy !== null &&
+      r.energy > 0 &&
+      (be === null || be <= 0 ? r.energy >= 5 : r.energy >= be * 1.3 + 1);
+    if (cpuRise || eRise) risen.push({ name, dCpu, cpuRise, eRise, bc, rc: r.cpu, be, re: r.energy });
+  }
+  if (risen.length === 0) {
+    return { ...none, note: "thermal rise detected but no process activity rise found" };
+  }
+  risen.sort((a, b) => b.dCpu - a.dCpu);
+
+  const sysEvidence: string[] = [];
+  if (tempRise && baseTemp !== null && recentTemp !== null)
+    sysEvidence.push(`CPU temperature increased (${baseTemp.toFixed(1)}°C → ${recentTemp.toFixed(1)}°C)`);
+  if (fanRise && baseFan !== null && recentFan !== null)
+    sysEvidence.push(`Fan RPM increased (${Math.round(baseFan)} → ${Math.round(recentFan)} RPM)`);
+
+  const contributors: Contributor[] = risen.slice(0, 3).map((r) => {
+    const evidence: string[] = [];
+    if (r.cpuRise) evidence.push(`CPU activity increased (${r.bc.toFixed(1)}% → ${r.rc.toFixed(1)}%)`);
+    if (r.eRise && r.be !== null && r.re !== null)
+      evidence.push(`Energy impact increased (${r.be.toFixed(1)} → ${r.re.toFixed(1)})`);
+    else if (r.eRise && r.re !== null)
+      evidence.push(`Energy impact appeared (${r.re.toFixed(1)})`);
+    evidence.push(...sysEvidence);
+    const isLikely = tempRise && fanRise;
+    return {
+      name: r.name,
+      verdict: isLikely ? "likely" : "possible",
+      evidence,
+      confidence: isLikely ? "medium" : "low",
+    };
+  });
+
+  const verdict: Verdict = tempRise && fanRise ? "likely" : "possible";
+  return {
+    verdict,
+    contributors,
+    confidence: verdict === "likely" ? "medium" : "low",
+    note: null,
+  };
+}
+
 async function detect(quiet = false) {
   const platform = process.platform;
   const nodeArch = process.arch;
@@ -237,25 +382,69 @@ function renderSnapshot(s: Snapshot) {
   else for (const e of s.energy) console.log(`  ${e.name} (${e.pid ?? "?"})  ${e.energy.toFixed(1)}`);
 }
 
+function renderAnalysis(a: Analysis) {
+  console.log("\nLikely thermal contributors");
+  if (a.verdict === "insufficient evidence" || a.contributors.length === 0) {
+    console.log("  insufficient evidence");
+    if (a.note) console.log(`  (${a.note})`);
+    return;
+  }
+  a.contributors.forEach((c, i) => {
+    console.log(`  ${i + 1}. ${c.name} — ${c.verdict} contributor`);
+    console.log("     Evidence:");
+    for (const e of c.evidence) console.log(`       ${e}`);
+    console.log(`     Confidence: ${c.confidence}`);
+  });
+  console.log("  (inference, not proven causation)");
+}
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const json = args.includes("--json");
   const once = args.includes("--once");
+  const noSave = args.includes("--no-save");
   let interval = 0;
   for (let i = 0; i < args.length; i++) {
-    const m = args[i].match(/^--interval(?:=(\d+(?:\.\d+)?))?$/);
+    const m = args[i]?.match(/^--interval(?:=(\d+(?:\.\d+)?))?$/);
     if (m) {
       interval = Number(m[1] ?? args[i + 1]);
       if (!Number.isFinite(interval) || interval <= 0) interval = 0;
     }
   }
-  return { json, once, interval };
+  return { json, once, interval, noSave };
+}
+
+function runId(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+async function saveSnapshot(runDir: string, n: number, payload: unknown): Promise<string> {
+  await $`mkdir -p ${runDir}`.text().catch(() => null);
+  const path = `${runDir}/${String(n).padStart(4, "0")}.json`;
+  await Bun.write(path, JSON.stringify(payload, null, 2));
+  const user = process.env.SUDO_USER;
+  if (user) {
+    try {
+      await $`chown ${user} ${runDir} ${path}`.text();
+    } catch {
+    }
+  }
+  return path;
 }
 
 async function main() {
-  const { json, once, interval } = parseArgs();
+  const { json, once, interval, noSave } = parseArgs();
   const system = await detect(json);
   if (system === null) return;
+
+  const dir = `snapshots/${runId()}`;
+  let n = 0;
+  const save = async (snapshot: Snapshot, analysis: Analysis | null) => {
+    if (noSave) return null;
+    const path = await saveSnapshot(dir, ++n, { system, snapshot, analysis });
+    if (!json) console.log(`\nSaved: ${path}`);
+    return path;
+  };
 
   if (json) {
     console.log(JSON.stringify({ system, snapshot: await collectSnapshot() }, null, 2));
@@ -263,15 +452,29 @@ async function main() {
   }
 
   if (once || interval <= 0) {
-    renderSnapshot(await collectSnapshot());
+    const s = await collectSnapshot();
+    const a = correlate([s]);
+    renderSnapshot(s);
+    if (!json) renderAnalysis(a);
+    await save(s, a);
     return;
   }
 
+  const history: Snapshot[] = [];
   while (true) {
     console.clear();
-    renderSnapshot(await collectSnapshot());
+    console.log("MacBook Fan Diagnostic");
+    console.log(`${system.model} · ${system.os} · every ${interval}s · sample #${n + 1} (history ${Math.min(n + 1, MAX_HISTORY)})`);
+    console.log("────────────────────────────────");
+    const s = await collectSnapshot();
+    history.push(s);
+    if (history.length > MAX_HISTORY) history.shift();
+    const a = correlate(history);
+    renderSnapshot(s);
+    renderAnalysis(a);
+    await save(s, a);
     await Bun.sleep(interval * 1000);
   }
 }
 
-await main();
+if (import.meta.main) await main();
